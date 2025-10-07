@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Команды — Preland{% endblock %}
+{% block content %}
+<section class="card">
+  <header class="card-header">
+    <h2>Мои команды</h2>
+    <a class="primary" href="{{ url_for('create_team') }}">Создать команду</a>
+  </header>
+  {% if teams %}
+  <ul class="list">
+    {% for team in teams %}
+    <li class="list-item">
+      <div>
+        <strong>{{ team.name }}</strong>
+        {% if team.description %}<p class="muted">{{ team.description }}</p>{% endif %}
+      </div>
+      <a class="secondary" href="{{ url_for('view_team', team_id=team.id) }}">Открыть</a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">Вы ещё не состоите ни в одной команде.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Новая команда — Preland{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>Создать команду</h2>
+  <form method="post" class="form-grid">
+    <label>
+      Название команды
+      <input type="text" name="name" required />
+    </label>
+    <label>
+      Описание
+      <textarea name="description" rows="3"></textarea>
+    </label>
+    <label>
+      Пароль команды
+      <input type="password" name="passphrase" required />
+    </label>
+    <button type="submit" class="primary">Создать</button>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Вход — Preland{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>Вход</h2>
+  <form method="post" class="form-grid">
+    <label>
+      Имя пользователя
+      <input type="text" name="username" required />
+    </label>
+    <label>
+      Пароль
+      <input type="password" name="password" required />
+    </label>
+    <button type="submit" class="primary">Войти</button>
+  </form>
+  <p class="muted">
+    Нет аккаунта?
+    <a href="{{ url_for('register') }}">Зарегистрируйтесь</a>
+  </p>
+</section>
+{% endblock %}

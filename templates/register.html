@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Регистрация — Preland{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>Регистрация</h2>
+  <form method="post" class="form-grid">
+    <label>
+      Имя пользователя
+      <input type="text" name="username" required />
+    </label>
+    <label>
+      Пароль
+      <input type="password" name="password" required />
+    </label>
+    <label>
+      Повторите пароль
+      <input type="password" name="confirm" required />
+    </label>
+    <button type="submit" class="primary">Создать аккаунт</button>
+  </form>
+  <p class="muted">
+    Уже зарегистрированы?
+    <a href="{{ url_for('login') }}">Войдите</a>
+  </p>
+</section>
+{% endblock %}
