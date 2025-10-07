@@ -1,379 +1,502 @@
-"""Графическое приложение для безопасного хранения личных данных."""
-
 from __future__ import annotations
 
-import tkinter as tk
-from dataclasses import dataclass
-from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from typing import Callable, Optional
+import os
+import secrets
+import json
+from collections import defaultdict
+from functools import wraps
+from io import BytesIO
+from typing import Callable, Dict, Optional
 
-from vault_manager import (
-    VaultAuthenticationError,
-    VaultInitializationError,
-    VaultManager,
+from flask import (
+    Flask,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
 )
+from flask_login import (
+    LoginManager,
+    current_user,
+    login_required,
+    login_user,
+    logout_user,
+)
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from werkzeug.datastructures import FileStorage
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from encryption import decrypt_data, derive_key, encrypt_data
+from models import Membership, Record, Team, User, db, init_app as init_db
 
 
-STORAGE_DIR = Path.home() / ".preland_vault"
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+app = Flask(__name__)
+app.config.setdefault("SECRET_KEY", os.environ.get("PRELAND_SECRET", secrets.token_hex(16)))
+app.config.setdefault("SQLALCHEMY_DATABASE_URI", os.environ.get("PRELAND_DATABASE", "sqlite:///preland.db"))
+app.config.setdefault("SQLALCHEMY_TRACK_MODIFICATIONS", False)
 
 
-@dataclass
-class EntryData:
-    title: str
-    username: str
-    secret: str
-    notes: str
-
-    @classmethod
-    def from_dict(cls, data: dict[str, str]) -> "EntryData":
-        return cls(
-            title=data.get("title", ""),
-            username=data.get("username", ""),
-            secret=data.get("secret", ""),
-            notes=data.get("notes", ""),
-        )
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "title": self.title,
-            "username": self.username,
-            "secret": self.secret,
-            "notes": self.notes,
-        }
+socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origins="*")
+_room_participants: Dict[int, set[str]] = defaultdict(set)
 
 
-class VaultApp(tk.Tk):
-    """Главное окно приложения."""
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("Preland Secure Vault")
-        self.geometry("800x500")
-        self.resizable(False, False)
-        self.vault = VaultManager(STORAGE_DIR)
-
-        self._active_frame: Optional[tk.Frame] = None
-        if self.vault.is_initialized():
-            self._show_login_frame()
-        else:
-            self._show_setup_frame()
-
-    # ---------- frame helpers ----------
-    def _set_frame(self, frame: tk.Frame) -> None:
-        if self._active_frame is not None:
-            self._active_frame.destroy()
-        self._active_frame = frame
-        self._active_frame.pack(fill=tk.BOTH, expand=True)
-
-    def _show_setup_frame(self) -> None:
-        frame = SetupFrame(self, on_success=self._show_login_frame)
-        self._set_frame(frame)
-
-    def _show_login_frame(self) -> None:
-        frame = LoginFrame(
-            self,
-            on_authenticated=self._show_vault_frame,
-            on_reset=self._show_setup_frame,
-        )
-        self._set_frame(frame)
-
-    def _show_vault_frame(self) -> None:
-        frame = VaultFrame(self, self.vault, on_logout=self._show_login_frame)
-        self._set_frame(frame)
+init_db(app)
 
 
-class SetupFrame(ttk.Frame):
-    """Форма первичной настройки и создания пароля."""
+@login_manager.user_loader
+def load_user(user_id: str) -> Optional[User]:
+    if user_id is None:
+        return None
+    return User.query.get(int(user_id))
 
-    def __init__(self, master: VaultApp, on_success: Callable[[], None]):
-        super().__init__(master, padding=40)
-        self.master = master
-        self.on_success = on_success
 
-        ttk.Label(self, text="Добро пожаловать в Preland Secure Vault", font=("Segoe UI", 16, "bold")).pack(
-            pady=(0, 30)
-        )
-        ttk.Label(self, text="Создайте главный пароль", font=("Segoe UI", 12)).pack(pady=(0, 20))
+@app.before_first_request
+def create_tables() -> None:
+    db.create_all()
 
-        self.password_var = tk.StringVar()
-        self.confirm_var = tk.StringVar()
 
-        ttk.Label(self, text="Пароль:").pack(anchor="w")
-        ttk.Entry(self, textvariable=self.password_var, show="*").pack(fill=tk.X, pady=(0, 10))
+@app.route("/")
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
 
-        ttk.Label(self, text="Повторите пароль:").pack(anchor="w")
-        ttk.Entry(self, textvariable=self.confirm_var, show="*").pack(fill=tk.X, pady=(0, 20))
 
-        ttk.Button(self, text="Создать", command=self._handle_create).pack()
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
 
-    def _handle_create(self) -> None:
-        password = self.password_var.get().strip()
-        confirm = self.confirm_var.get().strip()
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+        confirm = request.form.get("confirm", "").strip()
 
-        if not password:
-            messagebox.showerror("Ошибка", "Пароль не может быть пустым")
-            return
+        if not username or not password:
+            flash("Имя пользователя и пароль обязательны", "error")
+            return render_template("register.html")
         if password != confirm:
-            messagebox.showerror("Ошибка", "Пароли не совпадают")
-            return
-        try:
-            self.master.vault.initialize(password)
-        except VaultInitializationError as exc:
-            messagebox.showerror("Ошибка", str(exc))
-            return
-        messagebox.showinfo("Готово", "Главный пароль создан. Теперь войдите в хранилище.")
-        self.on_success()
+            flash("Пароли не совпадают", "error")
+            return render_template("register.html")
+        if User.query.filter_by(username=username).first():
+            flash("Пользователь с таким именем уже существует", "error")
+            return render_template("register.html")
+
+        user = User(username=username, password_hash=generate_password_hash(password))
+        db.session.add(user)
+        db.session.commit()
+        flash("Регистрация завершена. Войдите в систему.", "success")
+        return redirect(url_for("login"))
+
+    return render_template("register.html")
 
 
-class LoginFrame(ttk.Frame):
-    """Форма входа в хранилище."""
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
 
-    def __init__(self, master: VaultApp, on_authenticated: Callable[[], None], on_reset: Callable[[], None]):
-        super().__init__(master, padding=40)
-        self.master = master
-        self.on_authenticated = on_authenticated
-        self.on_reset = on_reset
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
 
-        ttk.Label(self, text="Введите пароль", font=("Segoe UI", 16, "bold")).pack(pady=(0, 20))
-        self.password_var = tk.StringVar()
-        entry = ttk.Entry(self, textvariable=self.password_var, show="*")
-        entry.pack(fill=tk.X, pady=(0, 20))
-        entry.focus_set()
+        user = User.query.filter_by(username=username).first()
+        if user is None or not check_password_hash(user.password_hash, password):
+            flash("Неверное имя пользователя или пароль", "error")
+            return render_template("login.html")
 
-        ttk.Button(self, text="Войти", command=self._handle_login).pack()
-        ttk.Button(self, text="Сбросить и создать заново", command=self._handle_reset).pack(pady=(10, 0))
+        login_user(user)
+        flash("Добро пожаловать обратно!", "success")
+        return redirect(url_for("dashboard"))
 
-    def _handle_login(self) -> None:
-        password = self.password_var.get()
-        try:
-            self.master.vault.authenticate(password)
-        except VaultAuthenticationError as exc:
-            messagebox.showerror("Ошибка", str(exc))
-            return
-        except VaultInitializationError as exc:
-            messagebox.showerror("Ошибка", str(exc))
-            return
-        self.on_authenticated()
+    return render_template("login.html")
 
-    def _handle_reset(self) -> None:
-        if messagebox.askyesno("Подтверждение", "Это удалит текущее хранилище. Продолжить?"):
+
+@app.route("/logout")
+@login_required
+def logout():
+    session.pop("team_keys", None)
+    logout_user()
+    flash("Вы вышли из системы.", "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    memberships = Membership.query.filter_by(user_id=current_user.id).all()
+    teams = [membership.team for membership in memberships]
+    return render_template("dashboard.html", teams=teams)
+
+
+@app.route("/teams/create", methods=["GET", "POST"])
+@login_required
+def create_team():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        passphrase = request.form.get("passphrase", "").strip()
+        description = request.form.get("description", "").strip()
+
+        if not name or not passphrase:
+            flash("Название команды и пароль обязательны", "error")
+            return render_template("create_team.html")
+
+        salt = secrets.token_bytes(16)
+        key = derive_key(passphrase, salt)
+        key_check = encrypt_data(key, b"preland-check")
+
+        team = Team(
+            name=name,
+            description=description,
+            owner=current_user,
+            salt=salt,
+            passphrase_hash=generate_password_hash(passphrase),
+            key_check=key_check,
+        )
+        db.session.add(team)
+        db.session.flush()
+
+        membership = Membership(user=current_user, team=team, role="owner")
+        db.session.add(membership)
+        db.session.commit()
+
+        _store_team_key(team.id, key)
+        flash("Команда создана", "success")
+        return redirect(url_for("view_team", team_id=team.id))
+
+    return render_template("create_team.html")
+
+
+def _team_member_required(fn: Callable) -> Callable:
+    @wraps(fn)
+    def wrapper(team_id: int, *args, **kwargs):
+        team = Team.query.get_or_404(team_id)
+        membership = Membership.query.filter_by(team_id=team.id, user_id=current_user.id).first()
+        if membership is None:
+            abort(403)
+        return fn(team, *args, **kwargs)
+
+    return wrapper
+
+
+@app.route("/teams/<int:team_id>", methods=["GET"])
+@login_required
+@_team_member_required
+def view_team(team: Team):
+    key = _get_team_key(team.id)
+    unlocked = key is not None
+    records: list[Dict[str, object]] = []
+    if unlocked:
+        for record in team.records:
             try:
-                if self.master.vault.config_path.exists():
-                    self.master.vault.config_path.unlink()
-                if self.master.vault.data_path.exists():
-                    self.master.vault.data_path.unlink()
-            except OSError as exc:
-                messagebox.showerror("Ошибка", f"Не удалось удалить файлы: {exc}")
-                return
-            self.on_reset()
+                payload = decrypt_data(key, record.encrypted_blob)
+                if record.record_type == "password":
+                    data = json.loads(payload.decode("utf-8"))
+                    records.append(
+                        {
+                            "id": record.id,
+                            "title": record.title,
+                            "type": "password",
+                            "username": data.get("username", ""),
+                            "secret": data.get("secret", ""),
+                            "notes": data.get("notes", ""),
+                            "owner": record.owner.username,
+                            "created_at": record.created_at,
+                        }
+                    )
+                elif record.record_type == "media":
+                    metadata = json.loads(payload.decode("utf-8"))
+                    records.append(
+                        {
+                            "id": record.id,
+                            "title": record.title,
+                            "type": "media",
+                            "filename": metadata.get("filename"),
+                            "mimetype": metadata.get("mimetype"),
+                            "size": metadata.get("size"),
+                            "owner": record.owner.username,
+                            "created_at": record.created_at,
+                        }
+                    )
+            except Exception:
+                flash(f"Не удалось расшифровать запись '{record.title}'", "error")
+    return render_template("team.html", team=team, records=records, unlocked=unlocked)
 
 
-class VaultFrame(ttk.Frame):
-    """Главный экран после авторизации."""
-
-    def __init__(self, master: VaultApp, vault: VaultManager, on_logout: Callable[[], None]):
-        super().__init__(master, padding=20)
-        self.master = master
-        self.vault = vault
-        self.on_logout = on_logout
-
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=2)
-
-        header = ttk.Frame(self)
-        header.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(header, text="Ваши записи", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
-        ttk.Button(header, text="Выйти", command=self._logout).pack(side=tk.RIGHT)
-
-        # List of entries
-        list_frame = ttk.Frame(self)
-        list_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 10), pady=(20, 0))
-        list_frame.rowconfigure(0, weight=1)
-        list_frame.columnconfigure(0, weight=1)
-
-        self.listbox = tk.Listbox(list_frame, height=20, exportselection=False)
-        self.listbox.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.listbox.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.listbox.config(yscrollcommand=scrollbar.set)
-        self.listbox.bind("<<ListboxSelect>>", lambda event: self._show_details())
-
-        btn_frame = ttk.Frame(list_frame)
-        btn_frame.grid(row=1, column=0, columnspan=2, pady=(10, 0))
-        ttk.Button(btn_frame, text="Добавить", command=self._add_entry).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Изменить", command=self._edit_entry).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Удалить", command=self._delete_entry).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Экспорт", command=self._export_entries).pack(side=tk.LEFT, padx=5)
-
-        # Detail panel
-        detail_frame = ttk.LabelFrame(self, text="Детали")
-        detail_frame.grid(row=1, column=1, sticky="nsew", pady=(20, 0))
-        detail_frame.rowconfigure(3, weight=1)
-        detail_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(detail_frame, text="Название:").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 5))
-        self.detail_title = ttk.Label(detail_frame, text="")
-        self.detail_title.grid(row=0, column=1, sticky="w", padx=10, pady=(10, 5))
-
-        ttk.Label(detail_frame, text="Логин/Имя:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
-        self.detail_username = ttk.Label(detail_frame, text="")
-        self.detail_username.grid(row=1, column=1, sticky="w", padx=10, pady=5)
-
-        ttk.Label(detail_frame, text="Пароль/Секрет:").grid(row=2, column=0, sticky="w", padx=10, pady=5)
-        self.detail_secret = ttk.Label(detail_frame, text="")
-        self.detail_secret.grid(row=2, column=1, sticky="w", padx=10, pady=5)
-
-        ttk.Label(detail_frame, text="Заметки:").grid(row=3, column=0, sticky="nw", padx=10, pady=5)
-        self.detail_notes = tk.Text(detail_frame, width=40, height=15, state="disabled", wrap="word")
-        self.detail_notes.grid(row=3, column=1, sticky="nsew", padx=10, pady=(5, 10))
-
-        self._refresh_entries()
-
-    # ---------- helpers ----------
-    def _refresh_entries(self) -> None:
-        self.listbox.delete(0, tk.END)
-        for entry in self.vault.data:
-            self.listbox.insert(tk.END, entry.get("title") or "(без названия)")
-        if self.vault.data:
-            self.listbox.selection_set(0)
-            self._show_details()
-        else:
-            self._clear_details()
-
-    def _get_selected_index(self) -> Optional[int]:
-        selected = self.listbox.curselection()
-        return selected[0] if selected else None
-
-    def _show_details(self) -> None:
-        index = self._get_selected_index()
-        if index is None:
-            self._clear_details()
-            return
-        entry = EntryData.from_dict(self.vault.data[index])
-        self.detail_title.config(text=entry.title)
-        self.detail_username.config(text=entry.username)
-        self.detail_secret.config(text=entry.secret)
-        self.detail_notes.configure(state="normal")
-        self.detail_notes.delete("1.0", tk.END)
-        self.detail_notes.insert("1.0", entry.notes)
-        self.detail_notes.configure(state="disabled")
-
-    def _clear_details(self) -> None:
-        self.detail_title.config(text="")
-        self.detail_username.config(text="")
-        self.detail_secret.config(text="")
-        self.detail_notes.configure(state="normal")
-        self.detail_notes.delete("1.0", tk.END)
-        self.detail_notes.configure(state="disabled")
-
-    def _add_entry(self) -> None:
-        editor = EntryEditor(self.master, title="Новая запись")
-        self.master.wait_window(editor)
-        if editor.result is not None:
-            self.vault.add_entry(editor.result.to_dict())
-            self._refresh_entries()
-
-    def _edit_entry(self) -> None:
-        index = self._get_selected_index()
-        if index is None:
-            messagebox.showwarning("Нет выбора", "Выберите запись для изменения")
-            return
-        entry = EntryData.from_dict(self.vault.data[index])
-        editor = EntryEditor(self.master, title="Редактировать запись", initial=entry)
-        self.master.wait_window(editor)
-        if editor.result is not None:
-            self.vault.update_entry(index, editor.result.to_dict())
-            self._refresh_entries()
-            self.listbox.selection_set(index)
-            self._show_details()
-
-    def _delete_entry(self) -> None:
-        index = self._get_selected_index()
-        if index is None:
-            messagebox.showwarning("Нет выбора", "Выберите запись для удаления")
-            return
-        if not messagebox.askyesno("Подтверждение", "Удалить выбранную запись?"):
-            return
-        self.vault.delete_entry(index)
-        self._refresh_entries()
-
-    def _export_entries(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Экспортировать записи",
-            defaultextension=".json",
-            filetypes=[("JSON файлы", "*.json"), ("Все файлы", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            self.vault.export_to(Path(path))
-        except OSError as exc:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {exc}")
-            return
-        messagebox.showinfo("Готово", "Записи успешно экспортированы")
-
-    def _logout(self) -> None:
-        self.master.vault._key = None  # type: ignore[attr-defined]
-        self.master.vault._data = []  # type: ignore[attr-defined]
-        self.on_logout()
+@app.route("/teams/<int:team_id>/unlock", methods=["POST"])
+@login_required
+@_team_member_required
+def unlock_team(team: Team):
+    passphrase = request.form.get("passphrase", "")
+    if not passphrase:
+        flash("Введите пароль команды", "error")
+        return redirect(url_for("view_team", team_id=team.id))
+    if not check_password_hash(team.passphrase_hash, passphrase):
+        flash("Неверный пароль команды", "error")
+        return redirect(url_for("view_team", team_id=team.id))
+    key = derive_key(passphrase, team.salt)
+    try:
+        decrypt_data(key, team.key_check)
+    except Exception:
+        flash("Ошибка при расшифровке. Попробуйте снова.", "error")
+        return redirect(url_for("view_team", team_id=team.id))
+    _store_team_key(team.id, key)
+    flash("Команда разблокирована", "success")
+    return redirect(url_for("view_team", team_id=team.id))
 
 
-class EntryEditor(tk.Toplevel):
-    """Окно создания или редактирования записи."""
-
-    def __init__(self, master: tk.Tk, title: str, initial: EntryData | None = None):
-        super().__init__(master)
-        self.title(title)
-        self.resizable(False, False)
-        self.result: EntryData | None = None
-
-        ttk.Label(self, text="Название:").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 5))
-        self.title_var = tk.StringVar(value=initial.title if initial else "")
-        ttk.Entry(self, textvariable=self.title_var).grid(row=0, column=1, padx=10, pady=(10, 5))
-
-        ttk.Label(self, text="Логин/Имя:").grid(row=1, column=0, sticky="w", padx=10, pady=5)
-        self.username_var = tk.StringVar(value=initial.username if initial else "")
-        ttk.Entry(self, textvariable=self.username_var).grid(row=1, column=1, padx=10, pady=5)
-
-        ttk.Label(self, text="Пароль/Секрет:").grid(row=2, column=0, sticky="w", padx=10, pady=5)
-        self.secret_var = tk.StringVar(value=initial.secret if initial else "")
-        ttk.Entry(self, textvariable=self.secret_var).grid(row=2, column=1, padx=10, pady=5)
-
-        ttk.Label(self, text="Заметки:").grid(row=3, column=0, sticky="nw", padx=10, pady=5)
-        self.notes_text = tk.Text(self, width=40, height=10, wrap="word")
-        self.notes_text.grid(row=3, column=1, padx=10, pady=5)
-        if initial:
-            self.notes_text.insert("1.0", initial.notes)
-
-        btn_frame = ttk.Frame(self)
-        btn_frame.grid(row=4, column=0, columnspan=2, pady=(10, 10))
-        ttk.Button(btn_frame, text="Сохранить", command=self._save).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Отмена", command=self.destroy).pack(side=tk.LEFT, padx=5)
-
-        self.grab_set()
-        self.transient(master)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-
-    def _save(self) -> None:
-        entry = EntryData(
-            title=self.title_var.get().strip(),
-            username=self.username_var.get().strip(),
-            secret=self.secret_var.get().strip(),
-            notes=self.notes_text.get("1.0", tk.END).strip(),
-        )
-        if not entry.title:
-            messagebox.showerror("Ошибка", "Название не может быть пустым")
-            return
-        self.result = entry
-        self.destroy()
+@app.route("/teams/<int:team_id>/lock", methods=["POST"])
+@login_required
+@_team_member_required
+def lock_team(team: Team):
+    _remove_team_key(team.id)
+    flash("Команда заблокирована", "success")
+    return redirect(url_for("view_team", team_id=team.id))
 
 
-def main() -> None:
-    app = VaultApp()
-    app.mainloop()
+@app.route("/teams/<int:team_id>/records/password", methods=["POST"])
+@login_required
+@_team_member_required
+def add_password_record(team: Team):
+    key = _require_team_key(team.id)
+    title = request.form.get("title", "").strip()
+    username = request.form.get("record_username", "").strip()
+    secret = request.form.get("record_secret", "").strip()
+    notes = request.form.get("record_notes", "").strip()
+
+    if not title:
+        flash("Введите название записи", "error")
+        return redirect(url_for("view_team", team_id=team.id))
+
+    payload = json.dumps({"username": username, "secret": secret, "notes": notes}).encode("utf-8")
+    encrypted_blob = encrypt_data(key, payload)
+
+    record = Record(
+        team=team,
+        owner=current_user,
+        title=title,
+        record_type="password",
+        encrypted_blob=encrypted_blob,
+    )
+    db.session.add(record)
+    db.session.commit()
+    flash("Пароль сохранён", "success")
+    return redirect(url_for("view_team", team_id=team.id))
+
+
+@app.route("/teams/<int:team_id>/records/media", methods=["POST"])
+@login_required
+@_team_member_required
+def add_media_record(team: Team):
+    key = _require_team_key(team.id)
+    file: Optional[FileStorage] = request.files.get("media_file")
+    title = request.form.get("title", "").strip()
+
+    if not file or file.filename == "":
+        flash("Выберите файл для загрузки", "error")
+        return redirect(url_for("view_team", team_id=team.id))
+
+    if not title:
+        title = file.filename
+
+    file.seek(0, os.SEEK_END)
+    size = file.tell()
+    file.seek(0)
+
+    metadata = {
+        "filename": file.filename,
+        "mimetype": file.mimetype,
+        "size": size,
+    }
+
+    encrypted_blob = encrypt_data(key, json.dumps(metadata).encode("utf-8"))
+    media_blob = encrypt_data(key, file.read())
+
+    record = Record(
+        team=team,
+        owner=current_user,
+        title=title,
+        record_type="media",
+        encrypted_blob=encrypted_blob,
+        media_blob=media_blob,
+    )
+    db.session.add(record)
+    db.session.commit()
+    flash("Файл загружен", "success")
+    return redirect(url_for("view_team", team_id=team.id))
+
+
+@app.route("/teams/<int:team_id>/records/<int:record_id>/download")
+@login_required
+@_team_member_required
+def download_media(team: Team, record_id: int):
+    key = _require_team_key(team.id)
+    record = Record.query.filter_by(id=record_id, team_id=team.id, record_type="media").first_or_404()
+    if record.media_blob is None:
+        abort(404)
+    metadata = json.loads(decrypt_data(key, record.encrypted_blob).decode("utf-8"))
+    payload = decrypt_data(key, record.media_blob)
+    return send_file(
+        BytesIO(payload),
+        mimetype=metadata.get("mimetype") or "application/octet-stream",
+        as_attachment=True,
+        download_name=metadata.get("filename") or f"record-{record.id}",
+    )
+
+
+@app.route("/teams/<int:team_id>/members", methods=["POST"])
+@login_required
+@_team_member_required
+def invite_member(team: Team):
+    username = request.form.get("username", "").strip()
+    if not username:
+        flash("Укажите имя пользователя", "error")
+        return redirect(url_for("view_team", team_id=team.id))
+    user = User.query.filter_by(username=username).first()
+    if user is None:
+        flash("Пользователь не найден", "error")
+        return redirect(url_for("view_team", team_id=team.id))
+    if Membership.query.filter_by(team_id=team.id, user_id=user.id).first():
+        flash("Пользователь уже в команде", "info")
+        return redirect(url_for("view_team", team_id=team.id))
+    membership = Membership(user=user, team=team, role="member")
+    db.session.add(membership)
+    db.session.commit()
+    flash("Пользователь добавлен в команду", "success")
+    return redirect(url_for("view_team", team_id=team.id))
+
+
+@app.route("/teams/<int:team_id>/conference")
+@login_required
+@_team_member_required
+def conference(team: Team):
+    return render_template("conference.html", team=team)
+
+
+def _store_team_key(team_id: int, key: bytes) -> None:
+    team_keys = session.setdefault("team_keys", {})
+    team_keys[str(team_id)] = key.decode("utf-8")
+    session.modified = True
+
+
+def _get_team_key(team_id: int) -> Optional[bytes]:
+    team_keys = session.get("team_keys", {})
+    key_str = team_keys.get(str(team_id))
+    if key_str is None:
+        return None
+    return key_str.encode("utf-8")
+
+
+def _remove_team_key(team_id: int) -> None:
+    team_keys = session.get("team_keys", {})
+    if str(team_id) in team_keys:
+        team_keys.pop(str(team_id))
+        session.modified = True
+
+
+def _require_team_key(team_id: int) -> bytes:
+    key = _get_team_key(team_id)
+    if key is None:
+        flash("Разблокируйте команду перед выполнением этого действия", "error")
+        abort(400)
+    return key
+
+
+def _parse_team_id(value) -> int:
+    try:
+        team_id = int(value)
+    except (TypeError, ValueError):
+        abort(400)
+    if team_id <= 0:
+        abort(400)
+    return team_id
+
+
+@socketio.on("join")
+@login_required
+def handle_join(data):
+    team_id = _parse_team_id(data.get("teamId"))
+    _ensure_team_member(team_id)
+    room = f"team-{team_id}"
+    participants = list(_room_participants[team_id])
+    join_room(room)
+    _room_participants[team_id].add(request.sid)
+    emit("participants", {"members": participants}, room=request.sid)
+    emit("participant-joined", {"sid": request.sid}, room=room, include_self=False)
+
+
+@socketio.on("leave")
+@login_required
+def handle_leave(data):
+    team_id = _parse_team_id(data.get("teamId"))
+    room = f"team-{team_id}"
+    leave_room(room)
+    if request.sid in _room_participants.get(team_id, set()):
+        _room_participants[team_id].discard(request.sid)
+        if not _room_participants[team_id]:
+            _room_participants.pop(team_id, None)
+    emit("participant-left", {"sid": request.sid}, room=room, include_self=False)
+
+
+@socketio.on("offer")
+@login_required
+def handle_offer(data):
+    team_id = _parse_team_id(data.get("teamId"))
+    target = data.get("target")
+    _ensure_team_member(team_id)
+    emit("offer", {"sdp": data.get("sdp"), "from": request.sid}, room=target)
+
+
+@socketio.on("answer")
+@login_required
+def handle_answer(data):
+    team_id = _parse_team_id(data.get("teamId"))
+    target = data.get("target")
+    _ensure_team_member(team_id)
+    emit("answer", {"sdp": data.get("sdp"), "from": request.sid}, room=target)
+
+
+@socketio.on("candidate")
+@login_required
+def handle_candidate(data):
+    team_id = _parse_team_id(data.get("teamId"))
+    target = data.get("target")
+    _ensure_team_member(team_id)
+    emit(
+        "candidate",
+        {"candidate": data.get("candidate"), "from": request.sid},
+        room=target,
+    )
+
+
+def _ensure_team_member(team_id: int) -> None:
+    if team_id <= 0:
+        abort(400)
+    team = Team.query.get(team_id)
+    if team is None:
+        abort(404)
+    membership = Membership.query.filter_by(team_id=team.id, user_id=current_user.id).first()
+    if membership is None:
+        abort(403)
+
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    for team_id, participants in list(_room_participants.items()):
+        if request.sid in participants:
+            participants.discard(request.sid)
+            emit("participant-left", {"sid": request.sid}, room=f"team-{team_id}", include_self=False)
+            if not participants:
+                _room_participants.pop(team_id, None)
+            break
 
 
 if __name__ == "__main__":
-    main()
+    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}{{ team.name }} — Preland{% endblock %}
+{% block content %}
+<section class="card">
+  <header class="card-header">
+    <div>
+      <h2>{{ team.name }}</h2>
+      {% if team.description %}<p class="muted">{{ team.description }}</p>{% endif %}
+    </div>
+    <div class="actions">
+      {% if unlocked %}
+      <form method="post" action="{{ url_for('lock_team', team_id=team.id) }}">
+        <button type="submit" class="secondary">Заблокировать</button>
+      </form>
+      {% endif %}
+      <a class="secondary" href="{{ url_for('conference', team_id=team.id) }}">Аудиоконференция</a>
+    </div>
+  </header>
+
+  {% if not unlocked %}
+  <form method="post" action="{{ url_for('unlock_team', team_id=team.id) }}" class="form-grid">
+    <label>
+      Пароль команды
+      <input type="password" name="passphrase" required />
+    </label>
+    <button type="submit" class="primary">Разблокировать</button>
+  </form>
+  {% else %}
+  <div class="grid">
+    <section>
+      <h3>Добавить пароль</h3>
+      <form method="post" action="{{ url_for('add_password_record', team_id=team.id) }}" class="form-grid">
+        <label>
+          Название
+          <input type="text" name="title" required />
+        </label>
+        <label>
+          Имя пользователя
+          <input type="text" name="record_username" />
+        </label>
+        <label>
+          Пароль/секрет
+          <input type="text" name="record_secret" />
+        </label>
+        <label>
+          Заметки
+          <textarea name="record_notes" rows="2"></textarea>
+        </label>
+        <button type="submit" class="primary">Сохранить</button>
+      </form>
+    </section>
+
+    <section>
+      <h3>Загрузить файл</h3>
+      <form method="post" action="{{ url_for('add_media_record', team_id=team.id) }}" enctype="multipart/form-data" class="form-grid">
+        <label>
+          Название
+          <input type="text" name="title" />
+        </label>
+        <label>
+          Файл
+          <input type="file" name="media_file" required />
+        </label>
+        <button type="submit" class="primary">Загрузить</button>
+      </form>
+    </section>
+  </div>
+
+  <section>
+    <h3>Записи</h3>
+    {% if records %}
+    <ul class="list">
+      {% for record in records %}
+      <li class="list-item">
+        <div>
+          <strong>{{ record.title }}</strong>
+          <p class="muted">Создал: {{ record.owner }} · {{ record.created_at.strftime('%d.%m.%Y %H:%M') }}</p>
+          {% if record.type == 'password' %}
+          <p><strong>Логин:</strong> {{ record.username or '—' }}</p>
+          <p><strong>Пароль:</strong> {{ record.secret or '—' }}</p>
+          {% if record.notes %}<p>{{ record.notes }}</p>{% endif %}
+          {% else %}
+          <p><strong>Файл:</strong> {{ record.filename }} ({{ record.size }} байт)</p>
+          <a class="secondary" href="{{ url_for('download_media', team_id=team.id, record_id=record.id) }}">Скачать</a>
+          {% endif %}
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="muted">Записей пока нет.</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h3>Пригласить участника</h3>
+    <form method="post" action="{{ url_for('invite_member', team_id=team.id) }}" class="form-inline">
+      <input type="text" name="username" placeholder="Имя пользователя" required />
+      <button type="submit" class="secondary">Пригласить</button>
+    </form>
+  </section>
+  {% endif %}
+</section>
+{% endblock %}
